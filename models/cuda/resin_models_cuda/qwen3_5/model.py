@@ -188,14 +188,60 @@ class PendingStates:
     """Verification inputs for every DeltaNet layer of one target forward."""
 
     layers: list[PendingDeltaState]
+    # The `[B, L, H, K, V]` states every layer started from, when stacked.
+    initial: Tensor | None = None
 
     def select(self, accepted: Tensor) -> tuple[Tensor, Tensor]:
         """Stack each layer's accepted state into the cache's `[B, L, ...]`."""
 
-        recurrent, convolution = zip(
-            *(layer.select(accepted) for layer in self.layers), strict=True
+        if self.initial is None or any(layer.reference for layer in self.layers):
+            recurrent, convolution = zip(
+                *(layer.select(accepted) for layer in self.layers), strict=True
+            )
+            return torch.stack(recurrent, dim=1), torch.stack(convolution, dim=1)
+        return self._select_batched(accepted)
+
+    def _select_batched(self, accepted: Tensor) -> tuple[Tensor, Tensor]:
+        """One masked replay over every (row, layer) pair.
+
+        Each pair is an independent sequence to the fused recurrence, so this
+        matches per-layer replays exactly while launching one kernel with
+        `layers`-times the parallelism, and its final states arrive already
+        in the cache's `[B, L, ...]` layout.
+        """
+
+        layers = self.layers
+        batch, tokens = layers[0].decay.shape[:2]
+
+        def stacked(name: str) -> Tensor:
+            return torch.stack([getattr(layer, name) for layer in layers], dim=1)
+
+        keep = torch.arange(tokens, device=accepted.device)[None] <= accepted[:, None]
+        keep = keep[:, None, :, None]
+        decay = (stacked("decay") * keep).flatten(0, 1)
+        beta = (stacked("beta") * keep.to(layers[0].beta.dtype)).flatten(0, 1)
+        kernels = _fla_kernels()
+        if kernels is None:
+            raise RuntimeError("FLA kernels disappeared after verification")
+        _, state = kernels[1](
+            stacked("query").flatten(0, 1),
+            stacked("key").flatten(0, 1),
+            stacked("value").flatten(0, 1),
+            g=decay,
+            beta=beta,
+            initial_state=self.initial.flatten(0, 1),
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
         )
-        return torch.stack(recurrent, dim=1), torch.stack(convolution, dim=1)
+        convolution_input = stacked("convolution_input")
+        length = convolution_input.shape[-1] - tokens
+        window = (accepted + 1)[:, None, None, None] + torch.arange(
+            length, device=accepted.device
+        )
+        convolution = convolution_input.gather(
+            -1, window.expand(-1, len(layers), convolution_input.shape[2], -1)
+        )
+        return state.float().view(batch, len(layers), *state.shape[1:]), convolution
 
 
 class Qwen35GatedDeltaNet(nn.Module):
@@ -818,7 +864,7 @@ class Qwen35TextModel(nn.Module):
                 features.append(hidden)
         final = normalized if compiled else self.norm(hidden)
         if step_states:
-            return final, PendingStates(recurrent_out), None
+            return final, PendingStates(recurrent_out, recurrent_states), None
         return (
             final,
             torch.stack(recurrent_out, dim=1),

@@ -20,6 +20,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from . import fused
+
 GROUP_SIZE_KEY = "conv_group_size"
 
 
@@ -58,6 +60,67 @@ def _grouped_dynamic_convolve(
     return output.view_as(hidden)
 
 
+def _residual_convolve(
+    residual: Tensor, hidden: Tensor, dynamic: Tensor, base: Tensor, group_size: int
+) -> Tensor:
+    return residual + _grouped_dynamic_convolve(hidden, dynamic, base, group_size)
+
+
+def _norm_rotary(hidden: Tensor, weight: Tensor, cos: Tensor, sin: Tensor, eps: float) -> Tensor:
+    """Per-head RMSNorm followed by rotary embedding (query/key path)."""
+
+    normed = _rms_norm(hidden, weight, eps)
+    return normed * cos + _rotate_half(normed) * sin
+
+
+def _silu_mul(gate: Tensor, up: Tensor) -> Tensor:
+    return F.silu(gate) * up
+
+
+def _rotary_tables(positions: Tensor, inv_freq: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
+    frequencies = positions.float()[..., None] * inv_freq
+    embeddings = torch.cat((frequencies, frequencies), dim=-1)
+    return embeddings.cos().to(dtype)[:, :, None], embeddings.sin().to(dtype)[:, :, None]
+
+
+def _select_path(
+    logits: Tensor,
+    projected: Tensor,
+    anchors: Tensor,
+    predecessor_codebook: Tensor,
+    successor_codebook: Tensor,
+    top_k: int,
+) -> Tensor:
+    """Greedy path through the top-k candidates with pairwise scores."""
+
+    unary, candidates = torch.topk(logits.float(), top_k, dim=-1, sorted=False)
+    projected = projected.float()
+    predecessor = anchors
+    path = []
+    for position in range(projected.shape[1]):
+        left = predecessor_codebook[predecessor].float() * projected[:, position]
+        right = successor_codebook[candidates[:, position]].float()
+        scores = unary[:, position] + torch.einsum("br,bkr->bk", left, right)
+        index = scores.argmax(dim=-1)
+        predecessor = candidates[:, position].gather(-1, index[:, None])[:, 0]
+        path.append(predecessor)
+    return torch.stack(path, dim=1)
+
+
+_COMPILED: dict = {}
+
+
+def _region(function, hidden: Tensor):
+    """`function`, compiled with Inductor inside decode graphs (see `fused`)."""
+
+    if not fused.use_fused(hidden):
+        return function
+    compiled = _COMPILED.get(function)
+    if compiled is None:
+        compiled = _COMPILED[function] = fused._compile(function)
+    return compiled
+
+
 class _DynamicConv(nn.Module):
     def __init__(self, hidden: int, kernel_size: int, group_size: int) -> None:
         super().__init__()
@@ -73,14 +136,16 @@ class _DynamicConv(nn.Module):
         dynamic = self.kernel_projection(hidden).view(
             *hidden.shape[:-1], 2, self.kernel_size, self.groups
         )
-        convolved = _grouped_dynamic_convolve(
+        convolved = _region(_grouped_dynamic_convolve, hidden)(
             hidden, dynamic[..., 0, :, :], self.base_kernel[0], self.group_size
         )
         return convolved, dynamic[..., 1, :, :]
 
-    def finish(self, hidden: Tensor, dynamic: Tensor) -> Tensor:
-        return _grouped_dynamic_convolve(
-            hidden, dynamic, self.base_kernel[1], self.group_size
+    def finish(self, residual: Tensor, hidden: Tensor, dynamic: Tensor) -> Tensor:
+        """`residual` plus the second dynamic convolution of `hidden`."""
+
+        return _region(_residual_convolve, hidden)(
+            residual, hidden, dynamic, self.base_kernel[1], self.group_size
         )
 
 
@@ -194,15 +259,12 @@ class DFlash2Drafter(nn.Module):
 
     def rotary(self, positions: Tensor, dtype: torch.dtype) -> tuple[Tensor, Tensor]:
         assert self.inv_freq is not None
-        frequencies = positions.float()[..., None] * self.inv_freq
-        embeddings = torch.cat((frequencies, frequencies), dim=-1)
-        return embeddings.cos().to(dtype)[:, :, None], embeddings.sin().to(dtype)[:, :, None]
+        return _region(_rotary_tables, positions[..., None])(positions, self.inv_freq, dtype)
 
     def _keys(self, layer: _Layer, hidden: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
         batch, tokens = hidden.shape[:2]
         keys = layer.k_proj(hidden).view(batch, tokens, self.kv_heads, self.head_dim)
-        keys = _rms_norm(keys, layer.k_norm, self.eps)
-        return keys * cos + _rotate_half(keys) * sin
+        return _region(_norm_rotary, hidden)(keys, layer.k_norm, cos, sin, self.eps)
 
     def write_context(
         self,
@@ -213,7 +275,8 @@ class DFlash2Drafter(nn.Module):
     ) -> None:
         """Store context keys/values for target features at `positions`."""
 
-        context = _rms_norm(self.fc(features), self.hidden_norm, self.eps)
+        projected = self.fc(features)
+        context = _region(_rms_norm, projected)(projected, self.hidden_norm, self.eps)
         cos, sin = self.rotary(positions, context.dtype)
         pages, offsets = slots
         keys_view, values_view = _draft_views(cache, self.kv_heads, self.head_dim)
@@ -241,40 +304,39 @@ class DFlash2Drafter(nn.Module):
         hidden = noise
         for index, layer in enumerate(self.layers):
             residual = hidden
-            normed = _rms_norm(hidden, layer.input_layernorm, self.eps)
+            normed = _region(_rms_norm, hidden)(hidden, layer.input_layernorm, self.eps)
             normed, finish = layer.attention_conv.prepare(normed)
             queries = layer.q_proj(normed).view(batch, tokens, self.heads, self.head_dim)
-            queries = _rms_norm(queries, layer.q_norm, self.eps)
-            queries = queries * cos + _rotate_half(queries) * sin
+            queries = _region(_norm_rotary, hidden)(
+                queries, layer.q_norm, cos, sin, self.eps
+            )
             keys = self._keys(layer, normed, cos, sin)
             values = layer.v_proj(normed).view(batch, tokens, self.kv_heads, self.head_dim)
             keys_view[pages + index, offsets] = keys.to(keys_view.dtype)
             values_view[pages + index, offsets] = values.to(values_view.dtype)
             attended = attention.run(queries.contiguous(), index)
             output = layer.o_proj(attended.reshape(batch, tokens, -1))
-            hidden = residual + layer.attention_conv.finish(output, finish)
+            hidden = layer.attention_conv.finish(residual, output, finish)
             residual = hidden
-            normed = _rms_norm(hidden, layer.post_attention_layernorm, self.eps)
+            normed = _region(_rms_norm, hidden)(
+                hidden, layer.post_attention_layernorm, self.eps
+            )
             normed, finish = layer.mlp_conv.prepare(normed)
-            output = layer.down_proj(F.silu(layer.gate_proj(normed)) * layer.up_proj(normed))
-            hidden = residual + layer.mlp_conv.finish(output, finish)
-        return _rms_norm(hidden, self.norm, self.eps)
+            gated = _region(_silu_mul, normed)(layer.gate_proj(normed), layer.up_proj(normed))
+            hidden = layer.mlp_conv.finish(residual, layer.down_proj(gated), finish)
+        return _region(_rms_norm, hidden)(hidden, self.norm, self.eps)
 
     def select(self, hidden: Tensor, logits: Tensor, anchors: Tensor) -> Tensor:
         """Greedy path through the top-k candidates with pairwise scores."""
 
-        unary, candidates = torch.topk(logits.float(), self.top_k, dim=-1, sorted=False)
-        projected = self.hidden_projection(hidden).float()
-        predecessor = anchors
-        path = []
-        for position in range(hidden.shape[1]):
-            left = self.predecessor_codebook[predecessor].float() * projected[:, position]
-            right = self.successor_codebook[candidates[:, position]].float()
-            scores = unary[:, position] + torch.einsum("br,bkr->bk", left, right)
-            index = scores.argmax(dim=-1)
-            predecessor = candidates[:, position].gather(-1, index[:, None])[:, 0]
-            path.append(predecessor)
-        return torch.stack(path, dim=1)
+        return _region(_select_path, hidden)(
+            logits,
+            self.hidden_projection(hidden),
+            anchors,
+            self.predecessor_codebook,
+            self.successor_codebook,
+            self.top_k,
+        )
 
 
 def _draft_views(cache, kv_heads: int, head_dim: int) -> tuple[Tensor, Tensor]:

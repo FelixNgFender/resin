@@ -289,3 +289,34 @@ def _paged_attention():
 def test_qwen_native_kernels(check):
     torch.manual_seed(93)
     check()
+
+
+def test_batched_masked_replay_matches_per_layer_replay():
+    """One replay over every (row, layer) pair equals one replay per layer."""
+
+    if qwen._fla_kernels() is None:
+        pytest.skip("requires flash-linear-attention")
+    torch.manual_seed(0)
+    batch, layers, tokens, key_heads, value_heads, dim, conv, history = 2, 3, 8, 2, 6, 64, 96, 3
+    device = "cuda"
+    initial = torch.randn(batch, layers, value_heads, dim, dim, device=device)
+    pending = []
+    for index in range(layers):
+        pending.append(
+            qwen.PendingDeltaState(
+                torch.randn(batch, tokens, key_heads, dim, device=device, dtype=torch.bfloat16),
+                torch.randn(batch, tokens, key_heads, dim, device=device, dtype=torch.bfloat16),
+                torch.randn(batch, tokens, value_heads, dim, device=device, dtype=torch.bfloat16),
+                -torch.rand(batch, tokens, value_heads, device=device),
+                torch.rand(batch, tokens, value_heads, device=device, dtype=torch.bfloat16),
+                initial[:, index],
+                torch.randn(batch, conv, history + tokens, device=device, dtype=torch.bfloat16),
+                False,
+            )
+        )
+    accepted = torch.tensor([2, 7], device=device)
+    expected = qwen.PendingStates(pending).select(accepted)
+    actual = qwen.PendingStates(pending, initial).select(accepted)
+    for left, right in zip(expected, actual, strict=True):
+        assert left.shape == right.shape
+        assert torch.equal(left, right)

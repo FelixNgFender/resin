@@ -228,19 +228,22 @@ class Qwen3_5CudaRunner(CudaRunner):
         ):
             for layer in self._drafter.layers:
                 quantize_linears_nvfp4(layer, nvfp4_backend)
+            # The context projection reads all five target feature layers.
+            self._drafter.fc = quantize_linears_nvfp4(self._drafter.fc, nvfp4_backend)
         if (
             nvfp4_backend == "cute-dsl"
             and os.environ.get("RESIN_NVFP4_AUTOTUNE", "1") != "0"
         ):
             width = speculative_tokens + 1
-            autotune_nvfp4_modules(
-                self._model,
-                {
-                    rows
-                    for batch in range(1, max_batch_size + 1)
-                    for rows in (batch, batch * width)
-                },
-            )
+            tuned_rows = {
+                rows
+                for batch in range(1, max_batch_size + 1)
+                for rows in (batch, batch * width)
+            }
+            autotune_nvfp4_modules(self._model, tuned_rows)
+            if self._drafter is not None:
+                # Drafter q/k/v/o and context shapes differ from the target's.
+                autotune_nvfp4_modules(self._drafter, tuned_rows)
         self._configure_parallel_graphs(self._model, parallel_groups)
         self.image_token_id = self.raw_config.get("image_token_id")
         vision_config = self.raw_config.get("vision_config") or {}
