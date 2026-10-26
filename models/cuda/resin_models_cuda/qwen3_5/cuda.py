@@ -78,7 +78,10 @@ from resin_models_cuda.qwen3_5.model import (
 )
 from resin_models_cuda.qwen3_5 import fused
 from resin_models_cuda.qwen3_5.dflash import DFlash2Drafter
-from resin_models_cuda.qwen3_5.quantization import warm_fp8_projections
+from resin_models_cuda.qwen3_5.quantization import (
+    requantize_projections_nvfp4,
+    warm_fp8_projections,
+)
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -208,6 +211,9 @@ class Qwen3_5CudaRunner(CudaRunner):
                 module.fuse_beta_decay()
             if fp8_fusion and isinstance(module, Qwen35GatedDeltaNet | Qwen35Attention):
                 module.fuse_fp8_projections()
+        if fp8_fusion and os.environ.get("RESIN_QWEN_PROJ_NVFP4", "0") == "1":
+            # Opt-in, changes outputs: 4-bit attention/DeltaNet projections.
+            requantize_projections_nvfp4(self._model, nvfp4_backend)
         if fp8_fusion:
             warm_fp8_projections(
                 self._model, max_batch_size * (speculative_tokens + 1)

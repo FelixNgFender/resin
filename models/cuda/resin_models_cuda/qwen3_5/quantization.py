@@ -104,6 +104,53 @@ class FusedFp8Projection(nn.Module):
         )
 
 
+class FusedNvfp4Projection(nn.Module):
+    """Opt-in: fused FP8 projections re-quantized to one NVFP4 W4A16 GEMM.
+
+    Dequantizes each FP8 source (weight x per-tensor scale) to BF16 and
+    quantizes the concatenation to NVFP4 with one global scale. Weights drop
+    from 8 to ~4.5 bits (fewer bytes per decode step) while activations stay
+    BF16. This changes the model's numerics, so it is off by default.
+    """
+
+    def __init__(self, sources: tuple[ModelOptFp8Linear, ...], backend) -> None:
+        super().__init__()
+        from resin_models_cuda.nvfp4 import Nvfp4Linear, nvfp4_weights_from_linear
+
+        in_features = sources[0].in_features
+        self.splits = tuple(source.out_features for source in sources)
+        weight = torch.cat(
+            [
+                (source.weight.float() * source.weight_scale.float()).to(torch.bfloat16)
+                for source in sources
+            ]
+        )
+        linear = nn.Linear(
+            in_features, weight.shape[0], bias=False, device=weight.device, dtype=torch.bfloat16
+        )
+        linear.weight.data = weight
+        self.linear = Nvfp4Linear(nvfp4_weights_from_linear(linear), backend)
+
+    def forward(self, hidden: Tensor) -> tuple[Tensor, ...]:
+        return tuple(self.linear(hidden).split(self.splits, dim=-1))
+
+
+def requantize_projections_nvfp4(model: nn.Module, backend) -> int:
+    """Replace every fused FP8 projection with an NVFP4 one; returns the count."""
+
+    count = 0
+    for module in list(model.modules()):
+        for name in ("fused_input", "fused_output", "fused_qkv"):
+            fused = getattr(module, name, None)
+            if isinstance(fused, FusedFp8Projection):
+                setattr(module, name, FusedNvfp4Projection(fused._sources, backend))
+                for source in fused._sources:
+                    # The FP8 copies are no longer read; free their weights.
+                    source.weight = source.weight.new_empty(0)
+                count += 1
+    return count
+
+
 def warm_fp8_projections(model: nn.Module, max_rows: int) -> int:
     """Compile and autotune every fused FP8 shape before CUDA graph capture."""
 
