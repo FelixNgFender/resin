@@ -541,7 +541,7 @@ class Qwen3_5CudaRunner(CudaRunner):
                 phase_timing.mark(0)
             attention.reset()
             recurrent, convolution, previous_hidden = self._initial_state(
-                cache, positions
+                cache, positions, fresh=False
             )
             if phase_timing is not None:
                 phase_timing.mark(1)
@@ -695,7 +695,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         )
 
     def _initial_state(
-        self, cache: DeviceCache, contexts: torch.Tensor
+        self, cache: DeviceCache, contexts: torch.Tensor, *, fresh: bool = True
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         positions = (contexts - 1).clamp_min(0)[:, None]
         recurrent, convolution, target_hidden = cache.state_at(positions)
@@ -703,10 +703,12 @@ class Qwen3_5CudaRunner(CudaRunner):
         recurrent = recurrent[:, 0]
         convolution = convolution[:, 0]
         target_hidden = target_hidden[:, 0]
-        new = contexts == 0
-        recurrent.masked_fill_(new[:, None, None, None, None], 0)
-        convolution.masked_fill_(new[:, None, None, None], 0)
-        target_hidden.masked_fill_(new[:, None], 0)
+        if fresh:
+            # Decode rows always extend a cached prefix; prefill may start one.
+            new = contexts == 0
+            recurrent.masked_fill_(new[:, None, None, None, None], 0)
+            convolution.masked_fill_(new[:, None, None, None], 0)
+            target_hidden.masked_fill_(new[:, None], 0)
         return recurrent, convolution, target_hidden
 
     @staticmethod

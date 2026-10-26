@@ -17,6 +17,7 @@ from resin_models_cuda.qwen3_5.attention import (
     PreparedPagedAttention,
     append_kv,
 )
+from resin_models_cuda.qwen3_5 import fused
 from resin_models_cuda.qwen3_5.cache import MTP_GROUP, TARGET_GROUP, DeviceCache
 from resin_models_cuda.qwen3_5.quantization import (
     FusedFp8Projection,
@@ -232,6 +233,7 @@ class Qwen35GatedDeltaNet(nn.Module):
             self.value_dim, config.hidden_size, quantized=quantized
         )
         self.beta_decay_weight: Tensor | None = None
+        self.negative_a: Tensor | None = None
         self.fused_input: nn.Module | None = None
         self.fused_output: nn.Module | None = None
 
@@ -256,6 +258,7 @@ class Qwen35GatedDeltaNet(nn.Module):
         self.beta_decay_weight = torch.cat(
             (self.in_proj_b.weight, self.in_proj_a.weight)
         ).detach()
+        self.negative_a = -self.A_log.detach().float().exp()
 
     def forward(
         self,
@@ -272,28 +275,34 @@ class Qwen35GatedDeltaNet(nn.Module):
         verification can keep any accepted prefix from one batched forward.
         """
         batch, tokens = hidden.shape[:2]
+        compiled = fused.use_fused(hidden)
         projected_z = None
         if self.fused_input is not None:
             projected_qkv, projected_z = self.fused_input(hidden)
         else:
             projected_qkv = self.in_proj_qkv(hidden)
-        mixed = projected_qkv.transpose(1, 2)
         state_length = self.config.linear_conv_kernel_dim - 1
         if convolution_state is None:
             convolution_state = torch.zeros(
                 batch,
                 self.conv_dim,
                 state_length,
-                dtype=mixed.dtype,
-                device=mixed.device,
+                dtype=projected_qkv.dtype,
+                device=projected_qkv.device,
             )
-        convolution_input = torch.cat((convolution_state, mixed), dim=-1)
-        mixed = F.silu(self.conv1d(convolution_input)).transpose(1, 2)
+        splits = (self.key_dim, self.key_dim, self.value_dim)
+        if compiled:
+            query, key, value, convolution_input = fused.short_convolution(
+                convolution_state, projected_qkv, self.conv1d.weight, splits
+            )
+        else:
+            convolution_input = torch.cat(
+                (convolution_state, projected_qkv.transpose(1, 2)), dim=-1
+            )
+            mixed = F.silu(self.conv1d(convolution_input)).transpose(1, 2)
+            query, key, value = torch.split(mixed, list(splits), dim=-1)
         convolution_state = convolution_input[..., -state_length:]
 
-        query, key, value = torch.split(
-            mixed, [self.key_dim, self.key_dim, self.value_dim], dim=-1
-        )
         query = query.view(
             batch,
             tokens,
@@ -307,16 +316,26 @@ class Qwen35GatedDeltaNet(nn.Module):
             self.config.linear_num_value_heads,
             self.config.linear_value_head_dim,
         )
-        if self.beta_decay_weight is not None:
-            beta_logits, decay_logits = F.linear(
-                hidden, self.beta_decay_weight
-            ).split(self.config.linear_num_value_heads, dim=-1)
+        heads = self.config.linear_num_value_heads
+        if compiled and self.negative_a is not None:
+            beta, decay = fused.delta_gates(
+                F.linear(hidden, self.beta_decay_weight),
+                self.negative_a,
+                self.dt_bias,
+                heads,
+            )
         else:
-            beta_logits, decay_logits = self.in_proj_b(hidden), self.in_proj_a(hidden)
-        beta = beta_logits.sigmoid()
-        decay = -self.A_log.float().exp() * F.softplus(
-            decay_logits.float() + self.dt_bias
-        )
+            if self.beta_decay_weight is not None:
+                beta_logits, decay_logits = F.linear(
+                    hidden, self.beta_decay_weight
+                ).split(heads, dim=-1)
+            else:
+                beta_logits = self.in_proj_b(hidden)
+                decay_logits = self.in_proj_a(hidden)
+            beta = beta_logits.sigmoid()
+            decay = -self.A_log.float().exp() * F.softplus(
+                decay_logits.float() + self.dt_bias
+            )
         if recurrent_state is None:
             recurrent_state = torch.zeros(
                 batch,
@@ -413,6 +432,18 @@ def _apply_rotary(query: Tensor, key: Tensor, cos: Tensor, sin: Tensor):
     )
 
 
+def kv_slots(
+    cache: DeviceCache, group_index: int, layer_count: int, positions: Tensor
+) -> tuple[Tensor, Tensor]:
+    """Layer-0 KV pages and in-page offsets, shared by every layer of a group."""
+
+    rows = cache.rows(group_index, 0, layer_count, positions)
+    return (
+        rows.div(cache.page_tokens, rounding_mode="floor"),
+        rows.remainder(cache.page_tokens),
+    )
+
+
 class Qwen35Attention(nn.Module):
     def __init__(
         self,
@@ -464,6 +495,7 @@ class Qwen35Attention(nn.Module):
         attention: PreparedPagedAttention | None,
         sequence_lengths: Tensor,
         max_sequence_length: int,
+        kv_slots: tuple[Tensor, Tensor] | None = None,
     ) -> Tensor:
         batch, tokens = hidden.shape[:2]
         if self.fused_qkv is not None:
@@ -472,27 +504,55 @@ class Qwen35Attention(nn.Module):
             projected_q = self.q_proj(hidden)
             projected_k = self.k_proj(hidden)
             projected_v = self.v_proj(hidden)
-        query, gate = projected_q.reshape(
-            batch, tokens, self.config.num_attention_heads, 2 * self.config.head_dim
-        ).chunk(2, dim=-1)
-        key = projected_k.reshape(
-            batch, tokens, self.config.num_key_value_heads, self.config.head_dim
-        )
-        value = projected_v.reshape_as(key)
-        query = self.q_norm(query)
-        key = self.k_norm(key)
-        query, key = _apply_rotary(query, key, cos, sin)
+        compiled = fused.use_fused(hidden) and cache is not None
+        if compiled:
+            assert cache is not None
+            query, gate, key, value = fused.attention_inputs(
+                projected_q,
+                projected_k,
+                projected_v,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos,
+                sin,
+                self.config.rms_norm_eps,
+                self.config.num_attention_heads,
+                self.config.num_key_value_heads,
+                self.config.head_dim,
+                cache.keys.dtype,
+            )
+        else:
+            query, gate = projected_q.reshape(
+                batch,
+                tokens,
+                self.config.num_attention_heads,
+                2 * self.config.head_dim,
+            ).chunk(2, dim=-1)
+            key = projected_k.reshape(
+                batch, tokens, self.config.num_key_value_heads, self.config.head_dim
+            )
+            value = projected_v.reshape_as(key)
+            query = self.q_norm(query)
+            key = self.k_norm(key)
+            query, key = _apply_rotary(query, key, cos, sin)
 
         if cache is not None:
-            append_kv(
-                cache,
-                group_index=self.cache_group,
-                layer=self.cache_layer,
-                layer_count=self.cache_layer_count,
-                positions=positions,
-                keys=key,
-                values=value,
-            )
+            if kv_slots is not None:
+                # Rows of layer L are the layer-0 rows shifted by L pages.
+                pages, offsets = kv_slots
+                pages = pages + self.cache_layer
+                cache.keys[pages, offsets] = key.to(cache.keys.dtype)
+                cache.values[pages, offsets] = value.to(cache.values.dtype)
+            else:
+                append_kv(
+                    cache,
+                    group_index=self.cache_group,
+                    layer=self.cache_layer,
+                    layer_count=self.cache_layer_count,
+                    positions=positions,
+                    keys=key,
+                    values=value,
+                )
             if attention is None:
                 raise RuntimeError("cached Qwen3.5 attention was not prepared")
             output = attention.run(query, self.cache_layer)
@@ -507,9 +567,12 @@ class Qwen35Attention(nn.Module):
                 is_causal=True,
                 scale=self.scaling,
             ).transpose(1, 2)
-        output = output.reshape(batch, tokens, -1) * torch.sigmoid(
-            gate.reshape(batch, tokens, -1)
-        )
+        if compiled:
+            output = fused.gated_output(output, gate)
+        else:
+            output = output.reshape(batch, tokens, -1) * torch.sigmoid(
+                gate.reshape(batch, tokens, -1)
+            )
         if self.fused_output is not None:
             (projected,) = self.fused_output(output)
             return projected
@@ -539,6 +602,10 @@ class Qwen35MLP(nn.Module):
         )
 
     def forward(self, hidden: Tensor) -> Tensor:
+        if fused.use_fused(hidden):
+            return self.down_proj(
+                fused.silu_mul(self.gate_proj(hidden), self.up_proj(hidden))
+            )
         return self.down_proj(F.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
 
 
@@ -683,9 +750,19 @@ class Qwen35TextModel(nn.Module):
         recurrent_out = []
         convolution_out = []
         linear_index = 0
-        for layer in cast(Sequence[Qwen35DecoderLayer], self.layers):
+        compiled = fused.use_fused(hidden) and cache is not None
+        slots = (
+            kv_slots(cache, TARGET_GROUP, self.config.full_layer_count, positions)
+            if compiled and cache is not None
+            else None
+        )
+        layers = cast(Sequence[Qwen35DecoderLayer], self.layers)
+        normalized = layers[0].input_layernorm(hidden) if compiled else None
+        eps = self.config.rms_norm_eps
+        for index, layer in enumerate(layers):
             residual = hidden
-            normalized = layer.input_layernorm(hidden)
+            if not compiled:
+                normalized = layer.input_layernorm(hidden)
             if layer.block_type == "linear_attention":
                 recurrent = (
                     None
@@ -713,13 +790,29 @@ class Qwen35TextModel(nn.Module):
                     attention,
                     sequence_lengths,
                     max_sequence_length,
+                    kv_slots=slots,
                 )
-            hidden = residual + mixed
-            hidden = hidden + (layer.prefill_ffn or layer.feed_forward)(hidden)
+            if compiled:
+                # Each residual add feeds the next RMSNorm in one kernel.
+                hidden, normalized = fused.add_rms_norm(
+                    residual, mixed, layer.post_attention_layernorm.weight, eps
+                )
+                following = (
+                    layers[index + 1].input_layernorm
+                    if index + 1 < len(layers)
+                    else self.norm
+                )
+                hidden, normalized = fused.add_rms_norm(
+                    hidden, layer.mlp(normalized), following.weight, eps
+                )
+            else:
+                hidden = residual + mixed
+                hidden = hidden + (layer.prefill_ffn or layer.feed_forward)(hidden)
+        final = normalized if compiled else self.norm(hidden)
         if step_states:
-            return self.norm(hidden), PendingStates(recurrent_out), None
+            return final, PendingStates(recurrent_out), None
         return (
-            self.norm(hidden),
+            final,
             torch.stack(recurrent_out, dim=1),
             torch.stack(convolution_out, dim=1),
         )
@@ -810,8 +903,14 @@ class Qwen35MTP(nn.Module):
             if cache is not None and attention_runtime is not None
             else None
         )
+        compiled = fused.use_fused(hidden) and cache is not None
+        slots = (
+            kv_slots(cache, MTP_GROUP, 1, positions)
+            if compiled and cache is not None
+            else None
+        )
         residual = hidden
-        hidden = residual + layer.self_attn(
+        mixed = layer.self_attn(
             layer.input_layernorm(hidden),
             positions,
             *rotary,
@@ -819,7 +918,18 @@ class Qwen35MTP(nn.Module):
             attention,
             sequence_lengths,
             max_sequence_length,
+            kv_slots=slots,
         )
+        if compiled:
+            eps = self.config.rms_norm_eps
+            hidden, normalized = fused.add_rms_norm(
+                residual, mixed, layer.post_attention_layernorm.weight, eps
+            )
+            _, normalized = fused.add_rms_norm(
+                hidden, layer.mlp(normalized), self.norm.weight, eps
+            )
+            return normalized
+        hidden = residual + mixed
         hidden = hidden + (layer.prefill_ffn or layer.feed_forward)(hidden)
         return self.norm(hidden)
 
