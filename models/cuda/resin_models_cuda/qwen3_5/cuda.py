@@ -185,6 +185,10 @@ class Qwen3_5CudaRunner(CudaRunner):
             attention_parallel=self.attention_parallel,
         )
         self.attention_config = self._model.language_model.config
+        lm_head = getattr(self._model, "lm_head", None)
+        if getattr(lm_head, "w4a4_weight", None) is not None:
+            # Serving scores one prefill row; keep prompt logprobs W4A16.
+            lm_head.w4a4_weight = None
         fp8_fusion = os.environ.get("RESIN_QWEN_FP8_TRITON", "1") != "0"
         for module in self._model.modules():
             if isinstance(module, Qwen35GatedDeltaNet):

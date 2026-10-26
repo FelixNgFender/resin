@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Iterable
 from typing import Literal
 
@@ -41,6 +42,11 @@ def swizzle_block_scales(scales: Tensor) -> Tensor:
         .contiguous()
         .reshape(padded_rows, padded_columns)
     )
+
+
+# Opt-in: prefill-sized NVFP4 GEMMs quantize activations to FP4 (W4A4).
+PREFILL_W4A4 = os.environ.get("RESIN_NVFP4_PREFILL_W4A4", "0") == "1"
+W4A4_MIN_ROWS = int(os.environ.get("RESIN_NVFP4_W4A4_MIN_ROWS", "256"))
 
 
 class Nvfp4LinearWeights(nn.Module):
@@ -88,6 +94,7 @@ class Nvfp4Linear(nn.Module):
         *,
         prepare: Callable[..., tuple[Tensor, Tensor, Tensor | None]] | None = None,
         mm: Callable[..., Tensor] | None = None,
+        w4a4: bool = False,
     ) -> None:
         super().__init__()
         self.in_features = source.in_features
@@ -111,6 +118,17 @@ class Nvfp4Linear(nn.Module):
         self.register_buffer("weight_scale_2", alpha)
         self.backend = backend
         self._mm = mm
+        self.w4a4_weight: Tensor | None = None
+        if w4a4:
+            # Optional FP4-activation path for large (prefill) row counts. It
+            # uses the checkpoint's calibrated activation scale and FP4 tensor
+            # cores (~4.7x the W4A16 rate on sm_120) at lower precision.
+            self.w4a4_weight = source.weight.detach().clone()
+            self.w4a4_scales = swizzle_block_scales(source.weight_scale)
+            self.w4a4_input = (1.0 / source.input_scale.float()).reshape(1)
+            self.w4a4_alpha = (
+                source.input_scale.float() * source.weight_scale_2.float()
+            ).reshape(1)
 
     def forward(self, hidden: Tensor, *, out: Tensor | None = None) -> Tensor:
         if hidden.dtype != torch.bfloat16:
@@ -118,6 +136,20 @@ class Nvfp4Linear(nn.Module):
         shape = (*hidden.shape[:-1], self.out_features)
         flat = hidden.reshape(-1, self.in_features)
         flat_out = None if out is None else out.reshape(-1, self.out_features)
+        if self.w4a4_weight is not None and flat.shape[0] >= W4A4_MIN_ROWS:
+            from flashinfer import fp4_quantize, mm_fp4
+
+            packed, packed_scales = fp4_quantize(flat, self.w4a4_input, 16, False, True)
+            result = mm_fp4(
+                packed,
+                self.w4a4_weight.T,
+                packed_scales,
+                self.w4a4_scales.T,
+                self.w4a4_alpha,
+                torch.bfloat16,
+                out=flat_out,
+            )
+            return result.reshape(shape)
         result = self._mm(
             flat,
             self.weight,
@@ -136,10 +168,11 @@ def prepare_nvfp4_modules(
 ) -> nn.Module:
     """Lower checkpoint containers; already prepared modules pass through."""
 
+    w4a4 = PREFILL_W4A4
     return prepare_model(
         model,
         lambda module: (
-            Nvfp4Linear(module, backend)
+            Nvfp4Linear(module, backend, w4a4=w4a4)
             if isinstance(module, Nvfp4LinearWeights)
             else module
         ),
