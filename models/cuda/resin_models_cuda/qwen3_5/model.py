@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, cast
 
 import torch
@@ -119,6 +119,81 @@ def _reference_delta_rule(
     return torch.stack(outputs, dim=1).to(output_dtype), state
 
 
+@dataclass(slots=True)
+class PendingDeltaState:
+    """One DeltaNet layer's verification inputs, awaiting an accepted prefix."""
+
+    query: Tensor
+    key: Tensor
+    value: Tensor
+    decay: Tensor
+    beta: Tensor
+    initial_state: Tensor
+    convolution_input: Tensor
+    reference: bool
+
+    def select(self, accepted: Tensor) -> tuple[Tensor, Tensor]:
+        """Return recurrent and convolution states after `accepted + 1` inputs.
+
+        Replays the recurrence with zero log-decay and zero beta past the
+        accepted prefix: those updates become exact identities (S * 1 + k 0),
+        so one fused call yields every row's accepted state without storing a
+        state per verified input.
+        """
+
+        tokens = self.decay.shape[1]
+        keep = torch.arange(tokens, device=accepted.device)[None] <= accepted[:, None]
+        decay = self.decay * keep[..., None]
+        beta = self.beta * keep[..., None].to(self.beta.dtype)
+        if self.reference:
+            repeats = self.value.shape[2] // self.query.shape[2]
+            _, state = _reference_delta_rule(
+                self.query.repeat_interleave(repeats, dim=2),
+                self.key.repeat_interleave(repeats, dim=2),
+                self.value,
+                decay,
+                beta,
+                self.initial_state,
+            )
+        else:
+            kernels = _fla_kernels()
+            if kernels is None:
+                raise RuntimeError("FLA kernels disappeared after verification")
+            _, state = kernels[1](
+                self.query,
+                self.key,
+                self.value,
+                g=decay,
+                beta=beta,
+                initial_state=self.initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
+        length = self.convolution_input.shape[-1] - tokens
+        window = (accepted + 1)[:, None, None] + torch.arange(
+            length, device=accepted.device
+        )
+        convolution = self.convolution_input.gather(
+            -1, window.expand(-1, self.convolution_input.shape[1], -1)
+        )
+        return state.float(), convolution
+
+
+@dataclass(slots=True)
+class PendingStates:
+    """Verification inputs for every DeltaNet layer of one target forward."""
+
+    layers: list[PendingDeltaState]
+
+    def select(self, accepted: Tensor) -> tuple[Tensor, Tensor]:
+        """Stack each layer's accepted state into the cache's `[B, L, ...]`."""
+
+        recurrent, convolution = zip(
+            *(layer.select(accepted) for layer in self.layers), strict=True
+        )
+        return torch.stack(recurrent, dim=1), torch.stack(convolution, dim=1)
+
+
 class Qwen35GatedDeltaNet(nn.Module):
     def __init__(self, config: Qwen35Config, *, quantized: bool = False) -> None:
         super().__init__()
@@ -153,13 +228,34 @@ class Qwen35GatedDeltaNet(nn.Module):
         self.out_proj = _projection(
             self.value_dim, config.hidden_size, quantized=quantized
         )
+        self.beta_decay_weight: Tensor | None = None
+
+    def fuse_beta_decay(self) -> None:
+        """Run the per-head beta and decay projections as one GEMM.
+
+        Each is only `heads x hidden`; cuBLAS launches two latency-bound
+        kernels for them (42 us at five rows on an RTX PRO 6000), while one
+        concatenated GEMM takes 5 us. Call after loading and sharding.
+        """
+
+        self.beta_decay_weight = torch.cat(
+            (self.in_proj_b.weight, self.in_proj_a.weight)
+        ).detach()
 
     def forward(
         self,
         hidden: Tensor,
         recurrent_state: Tensor | None,
         convolution_state: Tensor | None,
+        *,
+        step_states: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        """Advance the recurrence over `tokens` inputs.
+
+        With `step_states`, the returned recurrent and convolution states gain a
+        token axis holding the state after each input, so speculative
+        verification can keep any accepted prefix from one batched forward.
+        """
         batch, tokens = hidden.shape[:2]
         mixed = self.in_proj_qkv(hidden).transpose(1, 2)
         state_length = self.config.linear_conv_kernel_dim - 1
@@ -191,9 +287,15 @@ class Qwen35GatedDeltaNet(nn.Module):
             self.config.linear_num_value_heads,
             self.config.linear_value_head_dim,
         )
-        beta = self.in_proj_b(hidden).sigmoid()
+        if self.beta_decay_weight is not None:
+            beta_logits, decay_logits = F.linear(
+                hidden, self.beta_decay_weight
+            ).split(self.config.linear_num_value_heads, dim=-1)
+        else:
+            beta_logits, decay_logits = self.in_proj_b(hidden), self.in_proj_a(hidden)
+        beta = beta_logits.sigmoid()
         decay = -self.A_log.float().exp() * F.softplus(
-            self.in_proj_a(hidden).float() + self.dt_bias
+            decay_logits.float() + self.dt_bias
         )
         if recurrent_state is None:
             recurrent_state = torch.zeros(
@@ -210,6 +312,7 @@ class Qwen35GatedDeltaNet(nn.Module):
             repeats = (
                 self.config.linear_num_value_heads // self.config.linear_num_key_heads
             )
+            initial_state = recurrent_state
             core, recurrent_state = _reference_delta_rule(
                 query.repeat_interleave(repeats, dim=2),
                 key.repeat_interleave(repeats, dim=2),
@@ -217,6 +320,21 @@ class Qwen35GatedDeltaNet(nn.Module):
                 decay,
                 beta,
                 recurrent_state,
+            )
+        elif step_states:
+            # The fused recurrence visits inputs in order with an FP32 state,
+            # matching sequential single-token decode. Only outputs are needed
+            # here; the accepted state is replayed once acceptance is known.
+            initial_state = recurrent_state
+            core, _ = kernels[1](
+                query,
+                key,
+                value,
+                g=decay,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
             )
         else:
             # FLA handles grouped value heads without materializing repeated Q/K.
@@ -235,6 +353,18 @@ class Qwen35GatedDeltaNet(nn.Module):
         core = core.reshape(-1, self.config.linear_value_head_dim)
         gate = self.in_proj_z(hidden).reshape_as(core)
         core = self.norm(core, gate).view(batch, tokens, self.value_dim)
+        if step_states:
+            pending = PendingDeltaState(
+                query,
+                key,
+                value,
+                decay,
+                beta,
+                initial_state.float(),
+                convolution_input,
+                kernels is None,
+            )
+            return self.out_proj(core), pending, None
         return self.out_proj(core), recurrent_state.float(), convolution_state
 
 
@@ -481,6 +611,7 @@ class Qwen35TextModel(nn.Module):
         input_embeddings: Tensor | None = None,
         attention_runtime: PagedAttentionRuntime | None = None,
         rotary_positions: Tensor | None = None,
+        step_states: bool = False,
     ) -> tuple[Tensor, Tensor, Tensor]:
         hidden = (
             self.embed_tokens(token_ids)
@@ -525,7 +656,7 @@ class Qwen35TextModel(nn.Module):
                     else convolution_states[:, linear_index]
                 )
                 mixed, recurrent, convolution = layer.linear_attn(
-                    normalized, recurrent, convolution
+                    normalized, recurrent, convolution, step_states=step_states
                 )
                 recurrent_out.append(recurrent)
                 convolution_out.append(convolution)
@@ -543,6 +674,8 @@ class Qwen35TextModel(nn.Module):
                 )
             hidden = residual + mixed
             hidden = hidden + (layer.prefill_ffn or layer.feed_forward)(hidden)
+        if step_states:
+            return self.norm(hidden), PendingStates(recurrent_out), None
         return (
             self.norm(hidden),
             torch.stack(recurrent_out, dim=1),
@@ -689,4 +822,5 @@ __all__ = [
     "Qwen35MTP",
     "Qwen35RMSNorm",
     "Qwen35TextModel",
+    "PendingStates",
 ]

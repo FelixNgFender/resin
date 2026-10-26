@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Literal
 
 import torch
@@ -144,6 +144,81 @@ def prepare_nvfp4_modules(
             else module
         ),
     )
+
+
+def nvfp4_weights_from_linear(linear: nn.Linear) -> Nvfp4LinearWeights:
+    """Quantize a BF16 linear into ModelOpt-layout NVFP4 checkpoint storage.
+
+    One per-tensor FP32 scale maps the weight amax to E4M3 x E2M1 range, and
+    each 16-element block carries an E4M3 scale, matching ModelOpt exports.
+    """
+
+    from flashinfer import fp4_quantize
+
+    weight = linear.weight.detach().to(torch.bfloat16).contiguous()
+    out_features, in_features = weight.shape
+    global_scale = (448.0 * 6.0) / weight.abs().amax().float().clamp_min(1e-12)
+    packed, scales = fp4_quantize(weight, global_scale.reshape(1), 16, False, False)
+    source = Nvfp4LinearWeights(in_features, out_features).to(weight.device)
+    source.weight.copy_(packed.view(torch.uint8).reshape(out_features, -1))
+    source.weight_scale.copy_(
+        scales.view(torch.float8_e4m3fn).reshape(out_features, in_features // 16)
+    )
+    source.weight_scale_2.copy_(1.0 / global_scale)
+    source.input_scale.fill_(1.0)
+    return source
+
+
+def quantize_linears_nvfp4(
+    model: nn.Module, backend: Literal["cudnn", "cute-dsl"]
+) -> nn.Module:
+    """Replace every BF16 `nn.Linear` in `model` with an NVFP4 W4A16 linear."""
+
+    return prepare_model(
+        model,
+        lambda module: (
+            Nvfp4Linear(nvfp4_weights_from_linear(module), backend)
+            if type(module) is nn.Linear
+            and module.bias is None
+            and module.in_features % 16 == 0
+            else module
+        ),
+    )
+
+
+def autotune_nvfp4_modules(model: nn.Module, rows: Iterable[int]) -> int:
+    """Profile FlashInfer W4A16 tactics for every linear shape and row count.
+
+    Without tuning, the cute-DSL dispatch uses its streaming GEMV only at one
+    row and an MMA heuristic above it, which on an RTX PRO 6000 reads NVFP4
+    weights at ~0.85 TB/s for 2-16 rows versus ~1.37 TB/s for the tuned
+    tactics. Speculative verification and small decode batches live in that
+    range. Choices are cached in FlashInfer's process-wide autotuner, so this
+    must run before CUDA graph capture. Returns the number of tuned shapes.
+    """
+
+    from flashinfer.autotuner import autotune
+
+    counts = sorted({int(count) for count in rows if int(count) > 0})
+    seen: set[tuple[int, int]] = set()
+    with torch.inference_mode(), autotune(True):
+        for module in model.modules():
+            if not isinstance(module, Nvfp4Linear):
+                continue
+            shape = (module.in_features, module.out_features)
+            if shape in seen:
+                continue
+            seen.add(shape)
+            for count in counts:
+                hidden = torch.zeros(
+                    count,
+                    module.in_features,
+                    dtype=torch.bfloat16,
+                    device=module.weight.device,
+                )
+                module(hidden)
+    torch.cuda.synchronize()
+    return len(seen)
 
 
 def quantize_nvfp4(

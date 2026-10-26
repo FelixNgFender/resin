@@ -76,6 +76,35 @@ def test_delta_net_chunk_matches_recurrent_steps(value_heads: int) -> None:
     torch.testing.assert_close(convolution, expected_convolution)
 
 
+def test_delta_net_step_states_match_sequential_decode() -> None:
+    torch.manual_seed(9)
+    module = Qwen35GatedDeltaNet(replace(_tiny_config(), linear_num_value_heads=4))
+    _, recurrent, convolution = module(torch.randn(2, 5, 32), None, None)
+    hidden = torch.randn(2, 3, 32)
+
+    output, pending, _ = module(hidden, recurrent, convolution, step_states=True)
+    pieces, sequential = [], []
+    for step in range(hidden.shape[1]):
+        piece, recurrent, convolution = module(
+            hidden[:, step : step + 1], recurrent, convolution
+        )
+        pieces.append(piece)
+        sequential.append((recurrent, convolution))
+    torch.testing.assert_close(output, torch.cat(pieces, dim=1))
+    for first in range(3):
+        for second in range(3):
+            accepted = torch.tensor([first, second])
+            selected_recurrent, selected_convolution = pending.select(accepted)
+            for row, count in enumerate((first, second)):
+                expected_recurrent, expected_convolution = sequential[count]
+                torch.testing.assert_close(
+                    selected_recurrent[row], expected_recurrent[row]
+                )
+                torch.testing.assert_close(
+                    selected_convolution[row], expected_convolution[row]
+                )
+
+
 def test_prefill_ffn_regions_preserve_recurrent_continuation_and_changed_tokens():
     from test_cuda_runner_graph_policy import cpu_prefill_regions
 

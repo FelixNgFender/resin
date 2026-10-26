@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,12 @@ from resin.backend.cuda.paged_kv import SlabPagedKvCache
 from resin_models_cuda.paged_kv import append_slab_kv
 
 append_kv = append_slab_kv
+
+# FlashInfer always splits KV under CUDA graphs when allowed, with a fixed grid
+# sized to the device. Without it a batch-1 decode launches one CTA per KV head
+# (4 of 188 SMs on an RTX PRO 6000), so long-context decode attention becomes
+# latency bound. Splitting changes only the softmax merge order.
+GRAPH_SPLIT_KV = os.environ.get("RESIN_QWEN_GRAPH_SPLIT_KV", "1") != "0"
 
 
 def _plan_wrapper(
@@ -226,7 +233,7 @@ class GraphPagedAttentionRuntime:
                 "kv_data_type": cache.keys.dtype,
                 "o_data_type": torch.bfloat16,
                 "sm_scale": self.softmax_scale,
-                "disable_split_kv": True,
+                "disable_split_kv": not GRAPH_SPLIT_KV,
                 "non_blocking": False,
             }
             initial_indptr = torch.arange(
@@ -396,7 +403,7 @@ class GraphPagedAttentionRuntime:
                 "kv_data_type": self.cache.keys.dtype,
                 "o_data_type": torch.bfloat16,
                 "sm_scale": self.softmax_scale,
-                "disable_split_kv": True,
+                "disable_split_kv": not GRAPH_SPLIT_KV,
                 "non_blocking": False,
             }
             page_count = int(indptr[-1])
