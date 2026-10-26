@@ -18,7 +18,10 @@ from resin_models_cuda.qwen3_5.attention import (
     append_kv,
 )
 from resin_models_cuda.qwen3_5.cache import MTP_GROUP, TARGET_GROUP, DeviceCache
-from resin_models_cuda.qwen3_5.quantization import ModelOptFp8Linear
+from resin_models_cuda.qwen3_5.quantization import (
+    FusedFp8Projection,
+    ModelOptFp8Linear,
+)
 
 if TYPE_CHECKING:
     from transformers import Qwen3_5VisionModel
@@ -229,6 +232,18 @@ class Qwen35GatedDeltaNet(nn.Module):
             self.value_dim, config.hidden_size, quantized=quantized
         )
         self.beta_decay_weight: Tensor | None = None
+        self.fused_input: nn.Module | None = None
+        self.fused_output: nn.Module | None = None
+
+    def fuse_fp8_projections(self) -> None:
+        """Share one small-row FP8 GEMM for qkv and z (one activation scale)."""
+
+        if isinstance(self.in_proj_qkv, ModelOptFp8Linear) and isinstance(
+            self.in_proj_z, ModelOptFp8Linear
+        ):
+            self.fused_input = FusedFp8Projection([self.in_proj_qkv, self.in_proj_z])
+        if isinstance(self.out_proj, ModelOptFp8Linear):
+            self.fused_output = FusedFp8Projection([self.out_proj])
 
     def fuse_beta_decay(self) -> None:
         """Run the per-head beta and decay projections as one GEMM.
@@ -257,7 +272,12 @@ class Qwen35GatedDeltaNet(nn.Module):
         verification can keep any accepted prefix from one batched forward.
         """
         batch, tokens = hidden.shape[:2]
-        mixed = self.in_proj_qkv(hidden).transpose(1, 2)
+        projected_z = None
+        if self.fused_input is not None:
+            projected_qkv, projected_z = self.fused_input(hidden)
+        else:
+            projected_qkv = self.in_proj_qkv(hidden)
+        mixed = projected_qkv.transpose(1, 2)
         state_length = self.config.linear_conv_kernel_dim - 1
         if convolution_state is None:
             convolution_state = torch.zeros(
@@ -351,8 +371,14 @@ class Qwen35GatedDeltaNet(nn.Module):
                 use_qk_l2norm_in_kernel=True,
             )
         core = core.reshape(-1, self.config.linear_value_head_dim)
-        gate = self.in_proj_z(hidden).reshape_as(core)
+        if projected_z is None:
+            projected_z = self.in_proj_z(hidden)
+        gate = projected_z.reshape_as(core)
         core = self.norm(core, gate).view(batch, tokens, self.value_dim)
+        if self.fused_output is not None:
+            (projected,) = self.fused_output(core)
+        else:
+            projected = self.out_proj(core)
         if step_states:
             pending = PendingDeltaState(
                 query,
@@ -364,8 +390,8 @@ class Qwen35GatedDeltaNet(nn.Module):
                 convolution_input,
                 kernels is None,
             )
-            return self.out_proj(core), pending, None
-        return self.out_proj(core), recurrent_state.float(), convolution_state
+            return projected, pending, None
+        return projected, recurrent_state.float(), convolution_state
 
 
 def _rotate_half(hidden: Tensor) -> Tensor:
@@ -425,6 +451,8 @@ class Qwen35Attention(nn.Module):
         )
         self.q_norm = Qwen35RMSNorm(config.head_dim, config.rms_norm_eps)
         self.k_norm = Qwen35RMSNorm(config.head_dim, config.rms_norm_eps)
+        self.fused_qkv: nn.Module | None = None
+        self.fused_output: nn.Module | None = None
 
     def forward(
         self,
@@ -438,17 +466,19 @@ class Qwen35Attention(nn.Module):
         max_sequence_length: int,
     ) -> Tensor:
         batch, tokens = hidden.shape[:2]
-        query, gate = (
-            self.q_proj(hidden)
-            .view(
-                batch, tokens, self.config.num_attention_heads, 2 * self.config.head_dim
-            )
-            .chunk(2, dim=-1)
-        )
-        key = self.k_proj(hidden).view(
+        if self.fused_qkv is not None:
+            projected_q, projected_k, projected_v = self.fused_qkv(hidden)
+        else:
+            projected_q = self.q_proj(hidden)
+            projected_k = self.k_proj(hidden)
+            projected_v = self.v_proj(hidden)
+        query, gate = projected_q.reshape(
+            batch, tokens, self.config.num_attention_heads, 2 * self.config.head_dim
+        ).chunk(2, dim=-1)
+        key = projected_k.reshape(
             batch, tokens, self.config.num_key_value_heads, self.config.head_dim
         )
-        value = self.v_proj(hidden).view_as(key)
+        value = projected_v.reshape_as(key)
         query = self.q_norm(query)
         key = self.k_norm(key)
         query, key = _apply_rotary(query, key, cos, sin)
@@ -480,7 +510,19 @@ class Qwen35Attention(nn.Module):
         output = output.reshape(batch, tokens, -1) * torch.sigmoid(
             gate.reshape(batch, tokens, -1)
         )
+        if self.fused_output is not None:
+            (projected,) = self.fused_output(output)
+            return projected
         return self.o_proj(output)
+
+    def fuse_fp8_projections(self) -> None:
+        """Share one small-row FP8 GEMM for q, k and v (one activation scale)."""
+
+        sources = [self.q_proj, self.k_proj, self.v_proj]
+        if all(isinstance(source, ModelOptFp8Linear) for source in sources):
+            self.fused_qkv = FusedFp8Projection(sources)
+        if isinstance(self.o_proj, ModelOptFp8Linear):
+            self.fused_output = FusedFp8Projection([self.o_proj])
 
 
 class Qwen35MLP(nn.Module):

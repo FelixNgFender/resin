@@ -69,7 +69,12 @@ from resin_models_cuda.qwen3_5.checkpoint import (
     load_model,
     resolve_model_path,
 )
-from resin_models_cuda.qwen3_5.model import Qwen35DecoderLayer, Qwen35GatedDeltaNet
+from resin_models_cuda.qwen3_5.model import (
+    Qwen35Attention,
+    Qwen35DecoderLayer,
+    Qwen35GatedDeltaNet,
+)
+from resin_models_cuda.qwen3_5.quantization import warm_fp8_projections
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -180,9 +185,16 @@ class Qwen3_5CudaRunner(CudaRunner):
             attention_parallel=self.attention_parallel,
         )
         self.attention_config = self._model.language_model.config
+        fp8_fusion = os.environ.get("RESIN_QWEN_FP8_TRITON", "1") != "0"
         for module in self._model.modules():
             if isinstance(module, Qwen35GatedDeltaNet):
                 module.fuse_beta_decay()
+            if fp8_fusion and isinstance(module, Qwen35GatedDeltaNet | Qwen35Attention):
+                module.fuse_fp8_projections()
+        if fp8_fusion:
+            warm_fp8_projections(
+                self._model, max_batch_size * (speculative_tokens + 1)
+            )
         self.mtp_quantization = "bfloat16" if self._model.mtp is not None else None
         if (
             self._model.mtp is not None
