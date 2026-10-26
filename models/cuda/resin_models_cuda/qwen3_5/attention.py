@@ -33,6 +33,7 @@ def _plan_wrapper(
     head_dim: int,
     page_tokens: int,
     common: dict[str, Any],
+    causal: bool = True,
 ) -> None:
     args = (
         kv_indptr,
@@ -50,7 +51,7 @@ def _plan_wrapper(
             torch.arange(len(kv_indptr), dtype=torch.int32, device=kv_indptr.device)
             * tokens
         )
-        wrapper.plan(qo_indptr, *args, causal=True, **common)
+        wrapper.plan(qo_indptr, *args, causal=causal, **common)
 
 
 @dataclass(slots=True)
@@ -63,13 +64,19 @@ class PreparedPagedAttention:
     physical_pages: Tensor
     layer_count: int
     tokens: int
+    kv_view: tuple[int, int] | None = None
 
     def run(self, queries: Tensor, layer: int) -> Tensor:
         if not 0 <= layer < self.layer_count:
             raise ValueError("Qwen3.5 attention layer lies outside its cache group")
         torch.add(self.base_pages, layer, out=self.physical_pages)
         query = queries[:, 0] if self.tokens == 1 else queries.flatten(0, 1)
-        output = self.wrapper.run(query, (self.cache.keys, self.cache.values))
+        keys, values = self.cache.keys, self.cache.values
+        if self.kv_view is not None:
+            # Another head geometry over the same KV row bytes (a drafter's).
+            keys = keys.flatten(-2).unflatten(-1, self.kv_view)
+            values = values.flatten(-2).unflatten(-1, self.kv_view)
+        output = self.wrapper.run(query, (keys, values))
         return output.view_as(queries)
 
 
@@ -114,9 +121,17 @@ class PagedAttentionRuntime:
         sequence_lengths: Tensor,
         tokens: int,
         softmax_scale: float,
+        heads: tuple[int, int, int] | None = None,
+        causal: bool = True,
+        window_left: int = -1,
     ) -> PreparedPagedAttention:
         group = cache.groups[group_index]
         page_tokens = cache.page_tokens
+        query_heads, kv_heads, head_dim = heads or (
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+        )
         retained_starts = group.first_blocks * page_tokens
         used_lengths = (sequence_lengths - retained_starts).to(torch.int32)
         if bool(torch.any(used_lengths <= 0)):
@@ -147,6 +162,7 @@ class PagedAttentionRuntime:
             "kv_data_type": cache.keys.dtype,
             "o_data_type": torch.bfloat16,
             "sm_scale": softmax_scale,
+            "window_left": window_left,
         }
         wrapper = self.decode if tokens == 1 else self.prefill
         _plan_wrapper(
@@ -155,12 +171,14 @@ class PagedAttentionRuntime:
             kv_indptr,
             physical_pages,
             last_page_lengths,
-            num_attention_heads=self.num_attention_heads,
-            num_key_value_heads=self.num_key_value_heads,
-            head_dim=self.head_dim,
+            num_attention_heads=query_heads,
+            num_key_value_heads=kv_heads,
+            head_dim=head_dim,
             page_tokens=page_tokens,
             common=common,
+            causal=causal,
         )
+        view = None if heads is None else (kv_heads, head_dim)
         return PreparedPagedAttention(
             wrapper,
             cache,
@@ -168,6 +186,7 @@ class PagedAttentionRuntime:
             physical_pages,
             layer_count,
             tokens,
+            view,
         )
 
 
@@ -179,6 +198,12 @@ class GraphAttentionSpec:
     layer_count: int
     tokens: int
     sequence_offset: int
+    heads: tuple[int, int, int] | None = None
+    causal: bool = True
+    window_left: int = -1
+
+    def geometry(self, default: tuple[int, int, int]) -> tuple[int, int, int]:
+        return self.heads or default
 
 
 @dataclass(slots=True)
@@ -220,7 +245,9 @@ class GraphPagedAttentionRuntime:
         self._cursor = 0
         calls = []
         batch_size = cache.groups[0].slab_ids.shape[0]
+        default = (num_attention_heads, num_key_value_heads, head_dim)
         for spec in specs:
+            query_heads, kv_heads, spec_head_dim = spec.geometry(default)
             group = cache.groups[spec.group_index]
             page_capacity = batch_size * group.slab_ids.shape[1]
             base_pages = torch.empty(page_capacity, dtype=torch.int32, device=device)
@@ -232,9 +259,10 @@ class GraphPagedAttentionRuntime:
                 "q_data_type": torch.bfloat16,
                 "kv_data_type": cache.keys.dtype,
                 "o_data_type": torch.bfloat16,
-                "sm_scale": self.softmax_scale,
+                "sm_scale": spec_head_dim**-0.5,
                 "disable_split_kv": not GRAPH_SPLIT_KV,
                 "non_blocking": False,
+                "window_left": spec.window_left,
             }
             initial_indptr = torch.arange(
                 batch_size + 1, dtype=torch.int32, device=device
@@ -272,11 +300,12 @@ class GraphPagedAttentionRuntime:
                 initial_indptr,
                 initial_indices,
                 initial_last,
-                num_attention_heads=num_attention_heads,
-                num_key_value_heads=num_key_value_heads,
-                head_dim=head_dim,
+                num_attention_heads=query_heads,
+                num_key_value_heads=kv_heads,
+                head_dim=spec_head_dim,
                 page_tokens=cache.page_tokens,
                 common=common,
+                causal=spec.causal,
             )
             calls.append(
                 _GraphAttentionCall(
@@ -288,6 +317,7 @@ class GraphPagedAttentionRuntime:
                         physical_pages,
                         spec.layer_count,
                         spec.tokens,
+                        None if spec.heads is None else (kv_heads, spec_head_dim),
                     ),
                     kv_indptr,
                     last,
@@ -308,6 +338,9 @@ class GraphPagedAttentionRuntime:
         sequence_lengths: Tensor,
         tokens: int,
         softmax_scale: float,
+        heads: tuple[int, int, int] | None = None,
+        causal: bool = True,
+        window_left: int = -1,
     ) -> PreparedPagedAttention:
         del sequence_lengths
         if cache is not self.cache or self._cursor >= len(self.calls):
@@ -319,7 +352,11 @@ class GraphPagedAttentionRuntime:
             expected.group_index != group_index
             or expected.layer_count != layer_count
             or expected.tokens != tokens
-            or softmax_scale != self.softmax_scale
+            or expected.heads != heads
+            or expected.causal != causal
+            or expected.window_left != window_left
+            or softmax_scale
+            != expected.geometry((0, 0, self.head_dim))[2] ** -0.5
         ):
             raise RuntimeError("Qwen3.5 graph attention signature changed")
         return call.prepared
@@ -397,14 +434,18 @@ class GraphPagedAttentionRuntime:
                 page_tokens=self.cache.page_tokens,
             )
             physical = logical * spec.layer_count
+            query_heads, kv_heads, spec_head_dim = spec.geometry(
+                (self.num_attention_heads, self.num_key_value_heads, self.head_dim)
+            )
             common = {
                 "pos_encoding_mode": "NONE",
                 "q_data_type": torch.bfloat16,
                 "kv_data_type": self.cache.keys.dtype,
                 "o_data_type": torch.bfloat16,
-                "sm_scale": self.softmax_scale,
+                "sm_scale": spec_head_dim**-0.5,
                 "disable_split_kv": not GRAPH_SPLIT_KV,
                 "non_blocking": False,
+                "window_left": spec.window_left,
             }
             page_count = int(indptr[-1])
             # FlashInfer schedules on the host and copies these into its graph
@@ -420,11 +461,12 @@ class GraphPagedAttentionRuntime:
                 host_indptr,
                 host_pages,
                 host_last,
-                num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=self.num_key_value_heads,
-                head_dim=self.head_dim,
+                num_attention_heads=query_heads,
+                num_key_value_heads=kv_heads,
+                head_dim=spec_head_dim,
                 page_tokens=self.cache.page_tokens,
                 common=common,
+                causal=spec.causal,
             )
             inputs[f"attention.{index}.base_pages"] = physical
         self.reset()

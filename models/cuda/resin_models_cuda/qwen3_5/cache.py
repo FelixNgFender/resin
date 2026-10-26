@@ -60,7 +60,10 @@ class CacheGeometry:
         *,
         include_mtp: bool,
         kv_element_bytes: int = BF16_BYTES,
+        draft_layers: int = 1,
     ) -> CacheGeometry:
+        """`draft_layers` sizes the MTP group's blocks: 1 for the MTP head,
+        or a block drafter's layer count (whose KV rows share these bytes)."""
         if include_mtp:
             config.require_mtp()
         if kv_element_bytes not in {1, 2}:
@@ -86,7 +89,10 @@ class CacheGeometry:
             * BF16_BYTES
             + config.hidden_size * BF16_BYTES
         )
-        slab_bytes = math.ceil(state_bytes / target_block_bytes) * target_block_bytes
+        # Slabs must divide evenly into both groups' layer-major blocks.
+        lcm_layers = math.lcm(config.full_layer_count, draft_layers)
+        block_bytes = lcm_layers * unit_bytes
+        slab_bytes = math.ceil(state_bytes / block_bytes) * block_bytes
         slab_units = slab_bytes // unit_bytes
         return cls(
             full_layers=config.full_layer_count,
@@ -104,7 +110,7 @@ class CacheGeometry:
             slab_units=slab_units,
             target_blocks_per_slab=slab_units // config.full_layer_count,
             state_blocks_per_slab=slab_bytes // state_bytes,
-            mtp_blocks_per_slab=slab_units,
+            mtp_blocks_per_slab=slab_units // draft_layers,
         )
 
     @property

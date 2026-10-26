@@ -58,6 +58,7 @@ from resin_models_cuda.qwen3_5.attention import (
     PagedAttentionRuntime,
 )
 from resin_models_cuda.qwen3_5.cache import (
+    MTP_GROUP,
     PREFILL_CHUNK_SIZE,
     CacheArena,
     CacheGeometry,
@@ -71,10 +72,12 @@ from resin_models_cuda.qwen3_5.checkpoint import (
 )
 from resin_models_cuda.qwen3_5.model import (
     Qwen35Attention,
+    kv_slots,
     Qwen35DecoderLayer,
     Qwen35GatedDeltaNet,
 )
 from resin_models_cuda.qwen3_5 import fused
+from resin_models_cuda.qwen3_5.dflash import DFlash2Drafter
 from resin_models_cuda.qwen3_5.quantization import warm_fp8_projections
 
 if TYPE_CHECKING:
@@ -176,10 +179,19 @@ class Qwen3_5CudaRunner(CudaRunner):
         nvfp4_backend = select_nvfp4_backend(
             nvfp4_backend, torch.backends.cudnn.version()
         )
+        drafter_path = os.environ.get("RESIN_QWEN_DFLASH2")
+        self._drafter: DFlash2Drafter | None = None
+        if speculative_tokens and drafter_path:
+            self._drafter = DFlash2Drafter.load(Path(drafter_path), self.device)
+            if speculative_tokens != self._drafter.block_size - 1:
+                raise ValueError(
+                    "DFlash2 drafts block_size - 1 tokens: use "
+                    f"speculative_tokens={self._drafter.block_size - 1}"
+                )
         self._model, self.config, self.raw_config = load_model(
             self.model_path,
             device=self.device,
-            include_mtp=speculative_tokens > 0,
+            include_mtp=speculative_tokens > 0 and self._drafter is None,
             include_vision=True,
             nvfp4_backend=nvfp4_backend,
             tensor_parallel=self.expert_parallel,
@@ -210,6 +222,12 @@ class Qwen3_5CudaRunner(CudaRunner):
             # weight read from 0.85 GB to 0.24 GB.
             quantize_linears_nvfp4(self._model.mtp, nvfp4_backend)
             self.mtp_quantization = "nvfp4"
+        if (
+            self._drafter is not None
+            and os.environ.get("RESIN_QWEN_DRAFTER_NVFP4", "0") == "1"
+        ):
+            for layer in self._drafter.layers:
+                quantize_linears_nvfp4(layer, nvfp4_backend)
         if (
             nvfp4_backend == "cute-dsl"
             and os.environ.get("RESIN_NVFP4_AUTOTUNE", "1") != "0"
@@ -258,6 +276,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             self.attention_config,
             include_mtp=speculative_tokens > 0,
             kv_element_bytes=cache_dtype.itemsize,
+            draft_layers=1 if self._drafter is None else len(self._drafter.layers),
         )
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
@@ -467,6 +486,17 @@ class Qwen3_5CudaRunner(CudaRunner):
         if not self.speculative_tokens:
             return (GraphAttentionSpec(0, target, 1, 1),)
         width = self.speculative_tokens + 1
+        if self._drafter is not None:
+            return (
+                GraphAttentionSpec(
+                    MTP_GROUP,
+                    len(self._drafter.layers),
+                    width,
+                    width,
+                    *self._draft_attention(),
+                ),
+                GraphAttentionSpec(0, target, width, width),
+            )
         return (
             # Draft step s runs MTP at position p - 1 + s (sequence p + s).
             *(
@@ -543,7 +573,57 @@ class Qwen3_5CudaRunner(CudaRunner):
 
         def speculative_launch() -> None:
             with fused.decode_scope():
-                speculative_body()
+                if self._drafter is not None:
+                    dflash_body()
+                else:
+                    speculative_body()
+
+        def dflash_body() -> None:
+            attention.reset()
+            recurrent, convolution, _ = self._initial_state(
+                cache, positions, fresh=False
+            )
+            drafts, block_positions, slots = self._dflash_draft(
+                cache, token_ids, positions, attention_runtime=attention
+            )
+            features: list[torch.Tensor] = []
+            verify_ids = torch.cat((token_ids[:, None], drafts), dim=1)
+            verify_hidden, pending, _ = self._target_forward(
+                cache,
+                verify_ids,
+                block_positions,
+                recurrent,
+                convolution,
+                max_sequence_length=graph_seq_len,
+                attention_runtime=attention,
+                rotary_positions=(block_positions + rope_deltas[:, None])[
+                    None
+                ].expand(3, -1, -1),
+                step_states=True,
+                features=features,
+            )
+            targets = graph_sample_block(
+                self._sampler,
+                self._model.logits(verify_hidden),
+                sampling,
+                start_step=0,
+            )
+            matches = drafts == targets[:, : self.speculative_tokens]
+            accepted = torch.cumprod(matches.to(torch.int64), dim=1).sum(1)
+            rows = torch.arange(accepted.shape[0], device=self.device)
+            drafter = self._drafter
+            assert drafter is not None
+            drafter.write_context(
+                cache, torch.cat(features, dim=-1), block_positions, slots
+            )
+            self._store_state(
+                cache,
+                positions + accepted,
+                *pending.select(accepted),
+                verify_hidden[rows, accepted],
+            )
+            output_ids[:, : self.speculative_tokens].copy_(drafts)
+            output_ids[:, self.speculative_tokens :].copy_(targets)
 
         def speculative_body() -> None:
             # Draft-then-verify in one target pass. The committed anchor sits
@@ -752,6 +832,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         rotary_positions: torch.Tensor | None = None,
         input_embeddings: torch.Tensor | None = None,
         step_states: bool = False,
+        features: list | None = None,
     ):
         """Run target tokens through the phase-independent model operation."""
 
@@ -772,6 +853,10 @@ class Qwen3_5CudaRunner(CudaRunner):
             rotary_positions=rotary_positions,
             input_embeddings=input_embeddings,
             step_states=step_states,
+            features=features,
+            feature_layers=(
+                None if self._drafter is None else self._drafter.target_layer_ids
+            ),
         )
 
     def _mtp_forward(
@@ -813,6 +898,54 @@ class Qwen3_5CudaRunner(CudaRunner):
             max_sequence_length=max_sequence_length,
             attention_runtime=attention_runtime or self._attention,
         )
+
+    def _draft_attention(self) -> tuple[tuple[int, int, int], bool, int]:
+        drafter = self._drafter
+        assert drafter is not None
+        window = drafter.window - 1 if drafter.window else -1
+        return (drafter.heads, drafter.kv_heads, drafter.head_dim), False, window
+
+    def _dflash_draft(
+        self,
+        cache: DeviceCache,
+        anchors: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        attention_runtime: object | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Draft one block after each anchor; returns drafts and block positions."""
+
+        drafter = self._drafter
+        assert drafter is not None
+        width = drafter.block_size
+        block_positions = positions[:, None] + torch.arange(
+            width, dtype=torch.long, device=self.device
+        )
+        block_ids = torch.cat(
+            (
+                anchors[:, None],
+                anchors.new_full((anchors.shape[0], width - 1), drafter.mask_token_id),
+            ),
+            dim=1,
+        )
+        heads, causal, window = self._draft_attention()
+        runtime = self._attention if attention_runtime is None else attention_runtime
+        attention = runtime.prepare(
+            cache,
+            group_index=MTP_GROUP,
+            layer_count=len(drafter.layers),
+            sequence_lengths=positions + width,
+            tokens=width,
+            softmax_scale=heads[2] ** -0.5,
+            heads=heads,
+            causal=causal,
+            window_left=window,
+        )
+        slots = kv_slots(cache, MTP_GROUP, len(drafter.layers), block_positions)
+        noise = self._model.language_model.embed_tokens(block_ids)
+        hidden = drafter(noise, block_positions, cache, attention, slots)[:, 1:]
+        drafts = drafter.select(hidden, self._model.logits(hidden), anchors)
+        return drafts, block_positions, slots
 
     def _draft_chain(
         self,
@@ -951,6 +1084,9 @@ class Qwen3_5CudaRunner(CudaRunner):
             media = self._merge_media_embeddings(
                 plan, row, row_ids, row_positions, embeddings
             )
+            features: list[torch.Tensor] | None = (
+                None if self._drafter is None else []
+            )
             hidden, recurrent, convolution = self._target_forward(
                 row_cache,
                 row_ids,
@@ -960,7 +1096,21 @@ class Qwen3_5CudaRunner(CudaRunner):
                 max_sequence_length=context + end - start,
                 input_embeddings=embeddings,
                 rotary_positions=self._prefill_rotary_positions(media, row_positions),
+                features=features,
             )
+            if self._drafter is not None and features is not None:
+                # The drafter attends to target features of every prompt token.
+                self._drafter.write_context(
+                    row_cache,
+                    torch.cat(features, dim=-1),
+                    row_positions,
+                    kv_slots(
+                        row_cache,
+                        MTP_GROUP,
+                        len(self._drafter.layers),
+                        row_positions,
+                    ),
+                )
             final_logits.append(self._model.logits(hidden[:, -1]))
             if plan.needs_prompt_logprobs:
                 prompt_rows.append(
@@ -1039,6 +1189,54 @@ class Qwen3_5CudaRunner(CudaRunner):
         logits = self._model.logits(hidden[:, -1])
         return format_output(logits, self._sample(logits, plan), plan)
 
+    def _dflash_decode(
+        self,
+        plan: BatchPlan,
+        cache: DeviceCache,
+        anchors: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> ForwardOutput:
+        drafter = self._drafter
+        assert drafter is not None
+        contexts = torch.as_tensor(
+            plan.context_lengths, dtype=torch.long, device=self.device
+        )
+        rope_deltas = self._rope_deltas(plan)
+        recurrent, convolution, _ = self._initial_state(cache, contexts)
+        drafts, block_positions, slots = self._dflash_draft(cache, anchors, positions)
+        features: list[torch.Tensor] = []
+        verify_ids = torch.cat((anchors[:, None], drafts), dim=1)
+        verify_hidden, pending, _ = self._target_forward(
+            cache,
+            verify_ids,
+            block_positions,
+            recurrent,
+            convolution,
+            rotary_positions=(block_positions + rope_deltas[:, None])[None].expand(
+                3, -1, -1
+            ),
+            step_states=True,
+            features=features,
+        )
+        verify_logits = self._model.logits(verify_hidden)
+        targets = self._sample(verify_logits, plan, 0)
+        acceptance = self._speculation.accept(drafts.tolist(), targets.tolist())
+        accepted = torch.as_tensor(
+            acceptance.accepted_counts, dtype=torch.long, device=self.device
+        )
+        rows = torch.arange(accepted.shape[0], device=self.device)
+        drafter.write_context(cache, torch.cat(features, dim=-1), block_positions, slots)
+        self._store_state(
+            cache,
+            positions + accepted,
+            *pending.select(accepted),
+            verify_hidden[rows, accepted],
+        )
+        token_rows = [list(tokens) for tokens in acceptance.token_rows]
+        if plan.needs_logprobs:
+            return format_output(verify_logits, token_rows, plan)
+        return token_output(token_rows)
+
     def _speculative_decode(
         self,
         plan: BatchPlan,
@@ -1046,6 +1244,8 @@ class Qwen3_5CudaRunner(CudaRunner):
         anchors: torch.Tensor,
         positions: torch.Tensor,
     ) -> ForwardOutput:
+        if self._drafter is not None:
+            return self._dflash_decode(plan, cache, anchors, positions)
         phase_timing = self._eager_phase_timing(
             "decode", "draft", "target_verify", "decode"
         )

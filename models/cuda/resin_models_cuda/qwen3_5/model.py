@@ -721,7 +721,12 @@ class Qwen35TextModel(nn.Module):
         attention_runtime: PagedAttentionRuntime | None = None,
         rotary_positions: Tensor | None = None,
         step_states: bool = False,
+        features: list[Tensor] | None = None,
+        feature_layers: Sequence[int] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        """With `features`, append the residual stream after `feature_layers`."""
+
+        capture = set(feature_layers or ()) if features is not None else set()
         hidden = (
             self.embed_tokens(token_ids)
             if input_embeddings is None
@@ -808,6 +813,9 @@ class Qwen35TextModel(nn.Module):
             else:
                 hidden = residual + mixed
                 hidden = hidden + (layer.prefill_ffn or layer.feed_forward)(hidden)
+            if index in capture:
+                assert features is not None
+                features.append(hidden)
         final = normalized if compiled else self.norm(hidden)
         if step_states:
             return final, PendingStates(recurrent_out), None
