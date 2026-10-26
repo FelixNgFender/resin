@@ -62,6 +62,12 @@ def parse_args(argv=None):
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prompts", default=",".join(PROMPTS))
     parser.add_argument("--thinking", action="store_true")
+    parser.add_argument(
+        "--document",
+        type=Path,
+        help="prepend this text file (truncated to --document-tokens) to every prompt",
+    )
+    parser.add_argument("--document-tokens", type=int, default=0)
     parser.add_argument("--decode-graph", default="full")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--output", type=Path)
@@ -121,7 +127,14 @@ def main(argv=None) -> None:
     stops = generation.get("eos_token_id", [])
     stops = [stops] if isinstance(stops, int) else list(stops)
     names = args.prompts.split(",")
-    prompts = [(name, render(tokenizer, PROMPTS[name], args.thinking)) for name in names]
+    prefix = ""
+    if args.document is not None:
+        ids = tokenizer(args.document.read_text(errors="ignore"))["input_ids"]
+        prefix = tokenizer.decode(ids[: args.document_tokens])
+        prefix = "Here is a reference document:\n\n" + prefix + "\n\nNow, a separate task. "
+    prompts = [
+        (name, render(tokenizer, prefix + PROMPTS[name], args.thinking)) for name in names
+    ]
     capacity = args.context_length
 
     started = time.perf_counter()
@@ -197,6 +210,7 @@ def main(argv=None) -> None:
         top_p=args.top_p,
         top_k=args.top_k,
         thinking=args.thinking,
+        prompt_tokens=sum(len(tokens) for _, tokens in prompts) / len(prompts),
         decode_graph=args.decode_graph,
         load_s=load_s,
         capture_s=capture_s,
