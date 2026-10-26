@@ -74,6 +74,7 @@ from resin_models_cuda.qwen3_5.model import (
     Qwen35DecoderLayer,
     Qwen35GatedDeltaNet,
 )
+from resin_models_cuda.qwen3_5 import fused
 from resin_models_cuda.qwen3_5.quantization import warm_fp8_projections
 
 if TYPE_CHECKING:
@@ -515,6 +516,10 @@ class Qwen3_5CudaRunner(CudaRunner):
         )
 
         def ordinary_launch() -> None:
+            with fused.decode_scope():
+                ordinary_body()
+
+        def ordinary_body() -> None:
             attention.reset()
             recurrent, convolution, _ = self._initial_state(cache, positions)
             hidden, recurrent, convolution = self._target_forward(
@@ -537,6 +542,10 @@ class Qwen3_5CudaRunner(CudaRunner):
             )
 
         def speculative_launch() -> None:
+            with fused.decode_scope():
+                speculative_body()
+
+        def speculative_body() -> None:
             # Draft-then-verify in one target pass. The committed anchor sits
             # at `positions`; the stored target hidden state and MTP cache end
             # at the previous position, so every draft, verify and repair
@@ -1134,9 +1143,12 @@ class Qwen3_5CudaRunner(CudaRunner):
                 if plan.phase == BatchPhase.PREFILL:
                     with self._prefill_graphs():
                         return self._prefill(plan, rows, cache, token_ids, positions)
-                if self.speculative_tokens:
-                    return self._speculative_decode(plan, cache, token_ids, positions)
-                return self._ordinary_decode(plan, cache, token_ids, positions)
+                with fused.decode_scope():
+                    if self.speculative_tokens:
+                        return self._speculative_decode(
+                            plan, cache, token_ids, positions
+                        )
+                    return self._ordinary_decode(plan, cache, token_ids, positions)
 
     def release(self, sequence_ids: list[int]) -> None:
         """Release request-local image embeddings after Engine retirement."""

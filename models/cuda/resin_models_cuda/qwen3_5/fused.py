@@ -11,7 +11,9 @@ may differ from eager in the last BF16 bit.
 
 from __future__ import annotations
 
+import contextvars
 import os
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -22,9 +24,27 @@ MAX_FUSED_ROWS = 64
 ENABLED = os.environ.get("RESIN_QWEN_COMPILE", "1") != "0"
 
 
+_DECODE = contextvars.ContextVar("qwen3_5_fused_decode", default=False)
+
+
+@contextmanager
+def decode_scope():
+    """Enable the compiled regions for decode forwards only.
+
+    Decode row counts come from a few graph buckets; prefill chunks take any
+    length, and compiling each one would recompile without bound.
+    """
+
+    token = _DECODE.set(True)
+    try:
+        yield
+    finally:
+        _DECODE.reset(token)
+
+
 def use_fused(hidden: Tensor) -> bool:
     rows = hidden.numel() // hidden.shape[-1]
-    return ENABLED and hidden.is_cuda and rows <= MAX_FUSED_ROWS
+    return ENABLED and _DECODE.get() and hidden.is_cuda and rows <= MAX_FUSED_ROWS
 
 
 def _compile(function):
