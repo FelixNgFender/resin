@@ -407,19 +407,19 @@ class GraphPagedAttentionRuntime:
                 "non_blocking": False,
             }
             page_count = int(indptr[-1])
-            device_indptr = torch.as_tensor(
-                indptr, dtype=torch.int32, device=self.device
+            # FlashInfer schedules on the host and copies these into its graph
+            # buffers itself; device tensors would cost a sync per array.
+            host_indptr = torch.from_numpy(indptr)
+            host_pages = torch.from_numpy(
+                np.ascontiguousarray(physical[:page_count], dtype=np.int32)
             )
-            device_pages = torch.as_tensor(
-                physical[:page_count], dtype=torch.int32, device=self.device
-            )
-            device_last = torch.as_tensor(last, dtype=torch.int32, device=self.device)
+            host_last = torch.from_numpy(last)
             _plan_wrapper(
                 call.prepared.wrapper,
                 spec.tokens,
-                device_indptr,
-                device_pages,
-                device_last,
+                host_indptr,
+                host_pages,
+                host_last,
                 num_attention_heads=self.num_attention_heads,
                 num_key_value_heads=self.num_key_value_heads,
                 head_dim=self.head_dim,
